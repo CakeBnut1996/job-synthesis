@@ -4,7 +4,6 @@ import os
 import serpapi
 import psycopg2
 from psycopg2.extras import Json
-from dotenv import load_dotenv
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -19,22 +18,14 @@ DB_CONFIG = {
     'host': os.getenv("DB_HOST"),
     'port': os.getenv("DB_PORT")
 }
+
 SEARCH_PARAMS = {
     "engine": "google_jobs",
     "q": "transportation data engineering",
     "location": "United States",
     "api_key": API_KEY,
-    "num": 1
+    "num": 1 # number of searches
 }
-
-DB_CONFIG = {
-    'dbname': 'jobs_db',
-    'user': 'postgres',
-    'password': 'Post-19961101',  # TODO: Externalize this for security
-    'host': 'localhost',
-    'port': 5432
-}
-
 
 def fetch_jobs(params):
     """Fetch jobs using SerpAPI."""
