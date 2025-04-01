@@ -8,6 +8,9 @@ from sqlalchemy import create_engine
 from dotenv import load_dotenv
 load_dotenv()
 from transformers import pipeline
+import torch
+import re
+from collections import defaultdict
 
 DB_CONFIG = {
     'dbname': os.getenv("DB_NAME"),
@@ -43,24 +46,66 @@ def load_data():
     logging.info("Loaded %d job records", len(df))
     return df
 
-def extract_skills(texts):
-    """Use a Hugging Face model to extract keywords or named entities."""
+def chunk_text(text, max_length=512):
+    """Split text into chunks under max_length, respecting word boundaries."""
+    words = text.split()
+    chunks = []
+    chunk = []
+    total_len = 0
+    for word in words:
+        if total_len + len(word) + 1 <= max_length:
+            chunk.append(word)
+            total_len += len(word) + 1
+        else:
+            chunks.append(" ".join(chunk))
+            chunk = [word]
+            total_len = len(word) + 1
+    if chunk:
+        chunks.append(" ".join(chunk))
+    return chunks
+
+def extract_experience_and_skills(texts):
+    """
+    Extracts years of experience and associated skill mentions from job descriptions.
+    Returns a mapping: {years_of_experience: [skills]}.
+    """
+    # This model is better suited for job skill extraction (can switch to another depending on accuracy needs)
     extractor = pipeline("ner", model="dslim/bert-base-NER", grouped_entities=True)
-    all_skills = []
+
+    experience_skills = defaultdict(list)
+
     for text in texts:
-        entities = extractor(text[:512])  # Truncate long text
-        skills = [e["word"] for e in entities if e["entity_group"] in ["ORG", "MISC", "SKILL"]]
-        all_skills.append(skills)
-    return all_skills
+        # Extract years of experience
+        # e.g., "3+ years", "at least 5 years", "minimum of 2 years", etc.
+        experience_matches = re.findall(r'(\d{1,2})\+?\s*(?:years|yrs)', text, re.IGNORECASE)
+        years_list = [int(year) for year in experience_matches] if experience_matches else [0]
+
+        # Truncate input to 512 tokens
+        entities = []
+        for chunk in chunk_text(text):
+            tmp = extractor(chunk)
+            entities.extend(tmp)
+
+        # Extract words tagged as skills (entity_group might be 'SKILL' or something similar)
+        skills = [e['word'] for e in entities if 'skill' in e['entity_group'].lower()]
+        skills = list(set([skill.strip() for skill in skills if skill.strip()]))  # Deduplicate & clean
+
+        for year in years_list:
+            experience_skills[year].extend(skills)
+
+    # Deduplicate and clean final output
+    for year in experience_skills:
+        experience_skills[year] = sorted(set(experience_skills[year]))
+
+    return dict(experience_skills)
 
 def main():
     df = load_data()
-    df["skills"] = extract_skills(df[TEXT_COLUMN].tolist())
-    print(df[["id", "skills"]])
-
-    # Optional: Save back to DB or CSV
-    # df.to_sql("jobs_with_skills", engine, if_exists="replace", index=False)
-    # df.to_csv("extracted_skills.csv", index=False)
+    experience_skill_map = extract_experience_and_skills(df['description'].dropna().tolist())
+    for years, skills in sorted(experience_skill_map.items()):
+        print(f"{years} years experience:")
+        print(", ".join(skills))
+        print("-" * 40)
 
 if __name__ == "__main__":
     main()
