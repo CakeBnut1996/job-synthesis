@@ -1,16 +1,20 @@
 import logging
 import pandas as pd
-import os
+import os, sys
 import serpapi
 import psycopg2
 from psycopg2.extras import Json
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv() # need to load whenever add new config to the file
 from transformers import pipeline
 import torch
 import re
 from collections import defaultdict
+
+out_dir = os.getenv("OUTPUT_DIR")
+if not out_dir or not os.path.isdir(out_dir):
+    sys.exit(f"ERROR: OUTPUT_DIR is not set or does not exist. Please check your environment variable or create the folder manually.\nReceived: {out_dir}")
 
 DB_CONFIG = {
     'dbname': os.getenv("DB_NAME"),
@@ -46,54 +50,46 @@ def load_data():
     logging.info("Loaded %d job records", len(df))
     return df
 
-def chunk_text(text, max_length=512):
-    """Split text into chunks under max_length, respecting word boundaries."""
-    words = text.split()
-    chunks = []
-    chunk = []
-    total_len = 0
-    for word in words:
-        if total_len + len(word) + 1 <= max_length:
-            chunk.append(word)
-            total_len += len(word) + 1
-        else:
-            chunks.append(" ".join(chunk))
-            chunk = [word]
-            total_len = len(word) + 1
-    if chunk:
-        chunks.append(" ".join(chunk))
-    return chunks
+# Optional: a simple chunker to avoid 1024-token limit
+def chunk_text(text, max_tokens=512):
+    return [text[i:i+max_tokens] for i in range(0, len(text), max_tokens)]
 
-def extract_experience_and_skills(texts):
-    """
-    Extracts years of experience and associated skill mentions from job descriptions.
-    Returns a mapping: {years_of_experience: [skills]}.
-    """
-    # This model is better suited for job skill extraction (can switch to another depending on accuracy needs)
-    extractor = pipeline("ner", model="dslim/bert-base-NER", grouped_entities=True)
+# Helper to extract years of experience
+def extract_years(text):
+    matches = re.findall(r'(\d{1,2})\+?\s*(?:years|yrs)', text, re.IGNORECASE)
+    return [int(m) for m in matches] if matches else [0]
 
+# Main processing function
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+ner_extractor = pipeline("ner", model="Jean-Baptiste/roberta-large-ner-english", grouped_entities=True)
+
+def summarize_experience_to_skills(descriptions):
     experience_skills = defaultdict(list)
 
-    for text in texts:
-        # Extract years of experience
-        # e.g., "3+ years", "at least 5 years", "minimum of 2 years", etc.
-        experience_matches = re.findall(r'(\d{1,2})\+?\s*(?:years|yrs)', text, re.IGNORECASE)
-        years_list = [int(year) for year in experience_matches] if experience_matches else [0]
+    for text in descriptions:
+        years_list = extract_years(text)
 
-        # Truncate input to 512 tokens
-        entities = []
+        # Summarize long descriptions first
+        summary_chunks = []
         for chunk in chunk_text(text):
-            tmp = extractor(chunk)
-            entities.extend(tmp)
+            try:
+                summary = summarizer(chunk, min_length=5, max_length=30)[0]['summary_text']
+                summary_chunks.append(summary)
+            except:
+                continue  # In case of token length or model issues
 
-        # Extract words tagged as skills (entity_group might be 'SKILL' or something similar)
-        skills = [e['word'] for e in entities if 'skill' in e['entity_group'].lower()]
-        skills = list(set([skill.strip() for skill in skills if skill.strip()]))  # Deduplicate & clean
+        combined_summary = " ".join(summary_chunks)
 
-        for year in years_list:
-            experience_skills[year].extend(skills)
+        # Extract entities (skills) from summary
+        ner_entities = ner_extractor(combined_summary)
+        skills = [ent['word'] for ent in ner_entities if 'qualifications' in ent['entity_group'].lower() or 'MISC' in ent['entity_group']]
+        skills = list(set(s.strip() for s in skills if s.strip()))
 
-    # Deduplicate and clean final output
+        # Map to years of experience
+        for y in years_list:
+            experience_skills[y].extend(skills)
+
+    # Final cleanup
     for year in experience_skills:
         experience_skills[year] = sorted(set(experience_skills[year]))
 
@@ -101,11 +97,15 @@ def extract_experience_and_skills(texts):
 
 def main():
     df = load_data()
-    experience_skill_map = extract_experience_and_skills(df['description'].dropna().tolist())
-    for years, skills in sorted(experience_skill_map.items()):
-        print(f"{years} years experience:")
-        print(", ".join(skills))
-        print("-" * 40)
+    descriptions = df['description'].dropna().tolist()
+    exp_skill_map = summarize_experience_to_skills(descriptions)
+    exp_data = []
+    for yrs, skills in sorted(exp_skill_map.items()):
+        exp_data.append({'Years of Experience': yrs, 'Skills': ", ".join(skills)})
+
+    df_skills = pd.DataFrame(exp_data)
+    df_skills.to_csv(os.path.join(out_dir, "experience_skills.csv"), index=False)
+
 
 if __name__ == "__main__":
     main()
